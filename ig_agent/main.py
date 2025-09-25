@@ -1,216 +1,158 @@
-import os, json, asyncio
-from typing import Any, Dict, List, Optional
+import os
+import json
+import logging
+import requests
+from fastapi import FastAPI, Request, HTTPException
+from pydantic import BaseModel
 
-from fastapi import FastAPI, Request
-from fastapi.responses import PlainTextResponse, JSONResponse
-from dotenv import load_dotenv
-import httpx
+# -------------------------------------------------------------
+# FastAPI app
+# -------------------------------------------------------------
+app = FastAPI(title="Avant Webhooks")
+logger = logging.getLogger("uvicorn")
 
-# ── Load envs (Render uses dashboard env; local dev uses .env) ────────────────
-load_dotenv()
-
+# -------------------------------------------------------------
+# Environment
+# -------------------------------------------------------------
 VERIFY_TOKEN = os.getenv("VERIFY_TOKEN", "OEDA901124HQTLZB01")
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")  # optional
 
-# WhatsApp
+# WhatsApp (Cloud API)
 WHATSAPP_TOKEN = os.getenv("WHATSAPP_TOKEN", "")
-PHONE_ID = os.getenv("WHATSAPP_PHONE_NUMBER_ID", "") or os.getenv("PHONE_ID", "")
+WHATSAPP_PHONE_NUMBER_ID = os.getenv("WHATSAPP_PHONE_NUMBER_ID", "")
 
-# Instagram (Messaging uses a Page)
+# Instagram Messaging (via Page)
 IG_PAGE_ID = os.getenv("IG_PAGE_ID", "")
 IG_PAGE_ACCESS_TOKEN = os.getenv("IG_PAGE_ACCESS_TOKEN", "")
 
-# OpenAI (optional, for GPT replies)
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
+# -------------------------------------------------------------
+# Models
+# -------------------------------------------------------------
+class WhatsAppText(BaseModel):
+    to: str
+    body: str
 
-# ── HTTP client ───────────────────────────────────────────────────────────────
-client = httpx.AsyncClient(timeout=30.0)
+# -------------------------------------------------------------
+# Utilities
+# -------------------------------------------------------------
 
-app = FastAPI(title="Avant Webhook", version="1.0")
+def send_whatsapp_text(to: str, body: str) -> dict:
+    """Send a text message via WhatsApp Cloud API."""
+    if not (WHATSAPP_TOKEN and WHATSAPP_PHONE_NUMBER_ID):
+        logger.error("❗Missing WHATSAPP_TOKEN or WHATSAPP_PHONE_NUMBER_ID")
+        return {"error": "Missing WhatsApp credentials"}
 
-
-# ── Healthcheck ───────────────────────────────────────────────────────────────
-@app.get("/healthz")
-async def healthz():
-    return {"ok": True}
-
-
-# ── Shared: tiny GPT helper (optional) ────────────────────────────────────────
-async def generate_reply(user_text: str) -> str:
-    """
-    Uses OpenAI GPT if OPENAI_API_KEY present; otherwise echo.
-    """
-    if not OPENAI_API_KEY:
-        return f"You said: {user_text}"
-
-    try:
-        # Lazy import to avoid hard dependency if not used
-        from openai import OpenAI
-        ai = OpenAI(api_key=OPENAI_API_KEY)
-        resp = ai.chat.completions.create(
-            model="gpt-5-nano",
-            messages=[
-                {"role": "system", "content": "You are a concise, friendly WhatsApp/Instagram assistant."},
-                {"role": "user", "content": user_text},
-            ],
-            temperature=0.4,
-        )
-        msg = resp.choices[0].message["content"]
-        return msg.strip() if msg else f"You said: {user_text}"
-    except Exception as e:
-        print("❗OpenAI error:", e)
-        return f"You said: {user_text}"
-
-
-# ── WhatsApp: VERIFY (GET) ────────────────────────────────────────────────────
-@app.get("/webhook")
-async def wa_verify(request: Request):
-    params = request.query_params
-    mode = params.get("hub.mode")
-    token = params.get("hub.verify_token")
-    challenge = params.get("hub.challenge")
-
-    if mode == "subscribe" and token == VERIFY_TOKEN:
-        try:
-            return PlainTextResponse(str(int(challenge)))
-        except Exception:
-            return PlainTextResponse(challenge)
-    return PlainTextResponse("Verification failed", status_code=403)
-
-
-# ── WhatsApp: RECEIVE (POST) ──────────────────────────────────────────────────
-@app.post("/webhook")
-async def wa_receive(req: Request):
-    data = await req.json()
-    print("📩 WA event:", json.dumps(data, indent=2))
-
-    if data.get("object") != "whatsapp_business_account":
-        return PlainTextResponse("ignored")
-
-    try:
-        for entry in data.get("entry", []):
-            for change in entry.get("changes", []):
-                value = change.get("value", {})
-                messages = value.get("messages", [])
-                if not messages:
-                    continue
-
-                for m in messages:
-                    msg_type = m.get("type")
-                    from_wa = m.get("from")
-                    text_body = None
-
-                    if msg_type == "text":
-                        text_body = (m.get("text") or {}).get("body")
-
-                    # You can add image/audio handling here if needed
-
-                    if from_wa and text_body:
-                        reply = await generate_reply(text_body)
-                        await send_whatsapp_text(from_wa, reply)
-    except Exception as e:
-        print("❗WA handling error:", e)
-
-    return PlainTextResponse("ok")
-
-
-async def send_whatsapp_text(to: str, body: str):
-    if not (WHATSAPP_TOKEN and PHONE_ID):
-        print("❗Missing WHATSAPP_TOKEN or WHATSAPP_PHONE_NUMBER_ID")
-        return
-
-    url = f"https://graph.facebook.com/v22.0/{PHONE_ID}/messages"
+    url = (
+        f"https://graph.facebook.com/v19.0/{WHATSAPP_PHONE_NUMBER_ID}/messages"
+    )
     headers = {
         "Authorization": f"Bearer {WHATSAPP_TOKEN}",
         "Content-Type": "application/json",
     }
     payload = {
         "messaging_product": "whatsapp",
+        "recipient_type": "individual",
         "to": to,
         "type": "text",
-        "text": {"body": body[:4096]},
+        "text": {"preview_url": False, "body": body},
     }
+    resp = requests.post(url, headers=headers, json=payload, timeout=30)
+    try:
+        data = resp.json()
+    except Exception:
+        data = {"text": resp.text}
+    status = resp.status_code
+    level = logger.info if status < 300 else logger.error
+    level("➡️ send_whatsapp_text: %s %s", status, json.dumps(data))
+    return data
+
+# -------------------------------------------------------------
+# Debug helpers (safe to keep; helpful in Render)
+# -------------------------------------------------------------
+@app.on_event("startup")
+async def _print_routes_and_env():
+    routes = [getattr(r, "path", str(r)) for r in app.router.routes]
+    logger.info("DEBUG :: ROUTES = %s", routes)
+    logger.info(
+        "DEBUG :: VERIFY_TOKEN set:%s len:%d | IG_PAGE_ID set:%s | IG_TOKEN set:%s len:%d | WA creds:%s",
+        "yes" if VERIFY_TOKEN else "no",
+        len(VERIFY_TOKEN),
+        "yes" if IG_PAGE_ID else "no",
+        "yes" if IG_PAGE_ACCESS_TOKEN else "no",
+        len(IG_PAGE_ACCESS_TOKEN),
+        "yes" if (WHATSAPP_TOKEN and WHATSAPP_PHONE_NUMBER_ID) else "no",
+    )
+
+@app.middleware("http")
+async def _log_request_path(request: Request, call_next):
+    logger.info("DEBUG :: %s %s", request.method, request.url.path)
+    return await call_next(request)
+
+@app.get("/healthz")
+def healthz():
+    return {"ok": True}
+
+@app.get("/routes")
+def list_routes():
+    return [getattr(r, "path", str(r)) for r in app.router.routes]
+
+# -------------------------------------------------------------
+# WhatsApp Webhook (verify + receive)
+# -------------------------------------------------------------
+@app.get("/webhook")
+async def wa_verify(request: Request):
+    mode = request.query_params.get("hub.mode")
+    token = request.query_params.get("hub.verify_token")
+    challenge = request.query_params.get("hub.challenge")
+    if mode == "subscribe" and token == VERIFY_TOKEN and challenge:
+        return int(challenge)
+    raise HTTPException(status_code=404, detail="Not Found")
+
+@app.post("/webhook")
+async def wa_receive(payload: dict):
+    logger.info("📩 WA Incoming event: %s", json.dumps(payload))
 
     try:
-        r = await client.post(url, headers=headers, json=payload)
-        print("➡️ send_whatsapp_text:", r.status_code, r.text)
+        entry = payload.get("entry", [])[0]
+        change = entry.get("changes", [])[0]
+        value = change.get("value", {})
+        messages = value.get("messages")
+        if messages:
+            msg = messages[0]
+            from_wa = msg.get("from")
+            msg_type = msg.get("type")
+            if msg_type == "text":
+                body = msg.get("text", {}).get("body", "")
+                # Simple echo/ack
+                reply = f"Thanks! You said: {body}"
+                send_whatsapp_text(from_wa, reply)
     except Exception as e:
-        print("❗WA send error:", e)
+        logger.exception("Failed to process WA message: %s", e)
 
+    return {"status": "ok"}
 
-# ── Instagram: VERIFY (GET) ───────────────────────────────────────────────────
+# -------------------------------------------------------------
+# Instagram Webhook (verify + receive)
+# -------------------------------------------------------------
 @app.get("/ig_webhook")
 async def ig_verify(request: Request):
-    params = request.query_params
-    mode = params.get("hub.mode")
-    token = params.get("hub.verify_token")
-    challenge = params.get("hub.challenge")
+    mode = request.query_params.get("hub.mode")
+    token = request.query_params.get("hub.verify_token")
+    challenge = request.query_params.get("hub.challenge")
+    if mode == "subscribe" and token == VERIFY_TOKEN and challenge:
+        # Must return the challenge number to verify
+        return int(challenge)
+    raise HTTPException(status_code=403, detail="Verification failed")
 
-    if mode == "subscribe" and token == VERIFY_TOKEN:
-        try:
-            return PlainTextResponse(str(int(challenge)))
-        except Exception:
-            return PlainTextResponse(challenge)
-    return PlainTextResponse("Verification failed", status_code=403)
-
-
-# ── Instagram: RECEIVE (POST) ─────────────────────────────────────────────────
 @app.post("/ig_webhook")
-async def ig_receive(req: Request):
-    data = await req.json()
-    print("📩 IG event:", json.dumps(data, indent=2))
+async def ig_receive(payload: dict):
+    logger.info("📩 IG Incoming event: %s", json.dumps(payload))
+    # For now, just 200 OK so Meta considers delivery successful
+    return {"status": "ok"}
 
-    # Instagram messages can arrive with object 'instagram' (Webhooks for Instagram)
-    # or via Messenger-style 'page' for IG messaging. Handle both shapes.
-    obj = data.get("object")
-    try:
-        if obj in ("instagram", "page"):
-            for entry in data.get("entry", []):
-                # Messenger-style "messaging" array (common for IG DMs)
-                for m in entry.get("messaging", []):
-                    sender_id = (m.get("sender") or {}).get("id")
-                    message = m.get("message") or {}
-                    text = message.get("text")
-                    if sender_id and text:
-                        reply = await generate_reply(text)
-                        await ig_send_text(sender_id, reply)
-
-                # Instagram webhooks can also come as "changes"
-                for ch in entry.get("changes", []):
-                    value = ch.get("value", {})
-                    msgs = value.get("messages", [])
-                    for vmsg in msgs:
-                        sender_id = (vmsg.get("from") or {}).get("id") or vmsg.get("from")
-                        text = (vmsg.get("text") or {}).get("body") or vmsg.get("message")
-                        if sender_id and text:
-                            reply = await generate_reply(text)
-                            await ig_send_text(sender_id, reply)
-    except Exception as e:
-        print("❗IG handling error:", e)
-
-    return PlainTextResponse("ok")
-
-
-async def ig_send_text(psid: str, body: str):
-    if not (IG_PAGE_ID and IG_PAGE_ACCESS_TOKEN):
-        print("❗Missing IG_PAGE_ID or IG_PAGE_ACCESS_TOKEN")
-        return
-
-    url = f"https://graph.facebook.com/v19.0/{IG_PAGE_ID}/messages"
-    params = {"access_token": IG_PAGE_ACCESS_TOKEN}
-    payload = {
-        "recipient": {"id": psid},
-        "message": {"text": body[:1000]},
-        "messaging_type": "RESPONSE",
-    }
-
-    try:
-        r = await client.post(url, params=params, json=payload)
-        print("➡️ ig_send_text:", r.status_code, r.text)
-    except Exception as e:
-        print("❗IG send error:", e)
-
-
-# ── Graceful shutdown: close HTTPX client ─────────────────────────────────────
-@app.on_event("shutdown")
-async def _shutdown():
-    await client.aclose()
+# -------------------------------------------------------------
+# Optional: simple WhatsApp send test endpoint (POST JSON)
+# -------------------------------------------------------------
+@app.post("/send_wa_text")
+async def send_wa_text_api(item: WhatsAppText):
+    return send_whatsapp_text(item.to, item.body)
